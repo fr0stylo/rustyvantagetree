@@ -1,0 +1,10 @@
+[package]
+name = "mvprs"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+portable_smd=[]
+
+[dependencies]
+anyerror = "0.1.13"
