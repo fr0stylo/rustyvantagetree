@@ -8,3 +8,4 @@ portable_smd=[]
 
 [dependencies]
 anyerror = "0.1.13"
+rayon = "1.10.0"

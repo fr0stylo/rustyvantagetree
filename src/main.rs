@@ -30,21 +30,18 @@ fn hamming_distance(x: &Vec<u8>, y: &Vec<u8>) -> usize {
     for i in 0..chunks {
         let start = i * CHUNK_SIZE;
 
-        // Load 16 bytes into SIMD vectors
         let x_vec = u8x8::from_slice(&x[start..start + CHUNK_SIZE]);
         let y_vec = u8x8::from_slice(&y[start..start + CHUNK_SIZE]);
 
-        // XOR the vectors
         let xor_result = x_vec ^ y_vec;
 
-        // Count set bits in the result
         for j in 0..CHUNK_SIZE {
             count += xor_result[j].count_ones() as usize;
         }
     }
 
     // Handle remaining bytes
-    let remainder_start = chunks * 16;
+    let remainder_start = chunks * CHUNK_SIZE;
     for i in remainder_start..len {
         count += (x[i] ^ y[i]).count_ones() as usize;
     }
@@ -77,10 +74,10 @@ where
 pub trait TreeNode: Debug {
     fn search(
         &self,
-        i: Vec<u8>,
+        i: &Vec<u8>,
         radius: usize,
         k: usize,
-        results: &mut Vec<(usize, Vec<u8>)>,
+        results: Arc<Mutex<Vec<(usize, Vec<u8>)>>>,
     ) -> Result<(), AnyError>;
 
     fn add(&mut self, i: &Vec<u8>) -> Result<usize, AnyError>;
@@ -92,8 +89,8 @@ pub struct VPNode {
     vantage_point: Vec<u8>,
     threshhold: Option<usize>,
     values: BTreeSet<Vec<u8>>,
-    near_nodes: Option<Arc<Mutex<VPNode>>>,
-    far_nodes: Option<Arc<Mutex<VPNode>>>,
+    near_nodes: Option<Box<VPNode>>,
+    far_nodes: Option<Box<VPNode>>,
 }
 
 impl VPNode {
@@ -129,7 +126,7 @@ impl VPNode {
         }
     }
 
-    fn create_node<F>(&mut self, f: F) -> Option<Arc<Mutex<VPNode>>>
+    fn create_node<F>(&mut self, f: F) -> Option<Box<VPNode>>
     where
         F: Fn(&Vec<u8>) -> bool,
     {
@@ -149,21 +146,21 @@ impl VPNode {
             let _ = node.add(&x);
         });
 
-        Some(Arc::new(Mutex::new(node)))
+        Some(Box::new(node))
     }
 }
 
 impl TreeNode for VPNode {
     fn search(
         &self,
-        i: Vec<u8>,
+        i: &Vec<u8>,
         radius: usize,
         k: usize,
-        results: &mut Vec<(usize, Vec<u8>)>,
+        results: Arc<Mutex<Vec<(usize, Vec<u8>)>>>,
     ) -> Result<(), AnyError> {
         let dist = hamming_distance(&self.vantage_point, &i);
         if dist <= radius {
-            results.push((dist, i.clone()));
+            results.lock().unwrap().push((dist, i.clone()));
         }
 
         if self.near_nodes.is_none() && self.far_nodes.is_none() {
@@ -173,24 +170,24 @@ impl TreeNode for VPNode {
                 .map(|x| (hamming_distance(x, &i), x.clone()))
                 .filter(|&(x, _)| x <= radius)
                 .collect::<Vec<(usize, Vec<u8>)>>();
-            results.extend(res);
+            results.lock().unwrap().extend(res);
         } else {
-            if dist.saturating_add(radius) > self.threshhold.unwrap() {
-                let _ = self.far_nodes.clone().unwrap().lock().unwrap().search(
-                    i.clone(),
-                    radius,
-                    k,
-                    results,
-                );
-            }
-            if dist.saturating_sub(radius) <= self.threshhold.unwrap() {
-                let _ = self.near_nodes.clone().unwrap().lock().unwrap().search(
-                    i.clone(),
-                    radius,
-                    k,
-                    results,
-                );
-            }
+            rayon::join(
+                || {
+                    if dist.saturating_sub(radius) <= self.threshhold.unwrap() {
+                        if let Some(near_nodes) = &self.near_nodes {
+                            let _ = near_nodes.search(i, radius, k, Arc::clone(&results));
+                        }
+                    }
+                },
+                || {
+                    if dist.saturating_add(radius) > self.threshhold.unwrap() {
+                        if let Some(far_nodes) = &self.far_nodes {
+                            let _ = far_nodes.search(i, radius, k, Arc::clone(&results));
+                        }
+                    }
+                },
+            );
         }
 
         return Ok(());
@@ -205,9 +202,9 @@ impl TreeNode for VPNode {
         if self.near_nodes.is_none() && self.far_nodes.is_none() {
             self.create_leaf(i, dist);
         } else if dist > self.threshhold.unwrap() {
-            return self.far_nodes.as_mut().unwrap().lock().unwrap().add(i);
+            return self.far_nodes.as_mut().unwrap().add(i);
         } else {
-            return self.near_nodes.as_mut().unwrap().lock().unwrap().add(i);
+            return self.near_nodes.as_mut().unwrap().add(i);
         }
 
         Ok(dist)
@@ -215,8 +212,7 @@ impl TreeNode for VPNode {
 
     fn size(&self) -> usize {
         if !self.near_nodes.is_none() && !self.far_nodes.is_none() {
-            1 + self.far_nodes.clone().unwrap().lock().unwrap().size()
-                + self.near_nodes.clone().unwrap().lock().unwrap().size()
+            1 + self.far_nodes.as_ref().unwrap().size() + self.near_nodes.as_ref().unwrap().size()
         } else {
             self.values.len()
         }
@@ -252,14 +248,20 @@ impl VantagePointTree {
         }
         match self.tree.clone() {
             Some(tree) => {
-                let mut results = Vec::new();
+                let results = Arc::new(Mutex::new(Vec::new()));
                 let _ = tree
                     .lock()
                     .unwrap()
-                    .search(val.clone(), radius, 50, &mut results)
+                    .search(val, radius, 50, Arc::clone(&results))
                     .unwrap();
-                results.sort_by_key(|&(x, _)| x);
-                let top: Vec<(usize, Vec<u8>)> = results.iter().take(k).map(|x| x.clone()).collect();
+                results.lock().unwrap().sort_by_key(|&(x, _)| x);
+                let top: Vec<(usize, Vec<u8>)> = results
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .take(k)
+                    .map(|x| x.clone())
+                    .collect();
                 Ok(top)
             }
             None => Err(AnyError::error("Tree has not been created")),
@@ -304,7 +306,7 @@ fn seed_tree(tree: &mut VantagePointTree) -> Result<(), Error> {
     let values = OpenOptions::new().read(true).open("./file.vals")?;
     let mut buf = String::new();
     let mut reader = BufReader::new(values);
-    // let mut tree = VantagePointTree::new(CHUNK_SIZE);
+
     loop {
         let len = reader.read_line(&mut buf)?;
         if len == 0 {
@@ -346,7 +348,7 @@ mod tests {
 
         let term = "34ec86d2".as_bytes().to_vec();
 
-        b.iter(|| tree.search(&term, 10, 10));
+        b.iter(|| tree.search(&term, 5, 10));
     }
 
     #[bench]
