@@ -181,11 +181,14 @@ impl TreeNode for VPNode {
                 .map(|x| (hamming_distance(x, &i), x.clone()))
                 .filter(|&(x, _)| x <= radius)
                 .collect::<Vec<(usize, Vec<u8>)>>();
-            results.lock().unwrap().extend(res);
+            results.lock().expect("Results were locked").extend(res);
         } else if let Some(vantage_point) = &self.vantage_point {
             let dist = hamming_distance(vantage_point, i);
             if dist <= radius {
-                results.lock().unwrap().push((dist, i.to_vec()));
+                results
+                    .lock()
+                    .expect("Results were locked")
+                    .push((dist, i.to_vec()));
             }
 
             rayon::join(
