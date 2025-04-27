@@ -4,6 +4,7 @@ use std::{
     fmt::Debug,
     fs::OpenOptions,
     io::{BufRead, BufReader, Error},
+    process::Output,
     simd::u8x8,
     sync::{Arc, Mutex},
 };
@@ -12,6 +13,40 @@ use anyerror::AnyError;
 
 const CHUNK_SIZE: usize = 8;
 const LEAF_CAP: usize = 100;
+
+pub trait DistanceMetric<I, O> {
+    fn distance(&self, a: I, b: I) -> O;
+}
+
+struct HammingDistance;
+impl DistanceMetric<&[u8], usize> for HammingDistance {
+    fn distance(&self, x: &[u8], y: &[u8]) -> usize {
+        let len = x.len();
+        let mut count = 0;
+
+        let chunks = len / CHUNK_SIZE;
+        for i in 0..chunks {
+            let start = i * CHUNK_SIZE;
+
+            let x_vec = u8x8::from_slice(&x[start..start + CHUNK_SIZE]);
+            let y_vec = u8x8::from_slice(&y[start..start + CHUNK_SIZE]);
+
+            let xor_result = x_vec ^ y_vec;
+
+            for j in 0..CHUNK_SIZE {
+                count += xor_result[j].count_ones() as usize;
+            }
+        }
+
+        // Handle remaining bytes
+        let remainder_start = chunks * CHUNK_SIZE;
+        for i in remainder_start..len {
+            count += (x[i] ^ y[i]).count_ones() as usize;
+        }
+
+        count
+    }
+}
 
 fn to_bit_string(data: &[u8]) -> String {
     data.iter()
