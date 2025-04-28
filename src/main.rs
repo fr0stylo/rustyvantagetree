@@ -1,92 +1,32 @@
 #![feature(test, portable_simd)]
 
+pub mod distance;
+pub mod treeshaker;
+
 use std::{
+    cmp::{max, min},
     fmt::Debug,
     fs::OpenOptions,
     io::{BufRead, BufReader, Error},
-    process::Output,
-    simd::u8x8,
+    ops::AddAssign,
     sync::{Arc, Mutex},
+    usize,
 };
 
 use anyerror::AnyError;
+use distance::{DistanceMetric, HammingDistance};
+
+use treeshaker::*;
 
 const CHUNK_SIZE: usize = 8;
-const LEAF_CAP: usize = 100;
+const LEAF_CAP: usize = 512;
 
-pub trait DistanceMetric<I, O> {
-    fn distance(&self, a: I, b: I) -> O;
-}
-
-struct HammingDistance;
-impl DistanceMetric<&[u8], usize> for HammingDistance {
-    fn distance(&self, x: &[u8], y: &[u8]) -> usize {
-        let len = x.len();
-        let mut count = 0;
-
-        let chunks = len / CHUNK_SIZE;
-        for i in 0..chunks {
-            let start = i * CHUNK_SIZE;
-
-            let x_vec = u8x8::from_slice(&x[start..start + CHUNK_SIZE]);
-            let y_vec = u8x8::from_slice(&y[start..start + CHUNK_SIZE]);
-
-            let xor_result = x_vec ^ y_vec;
-
-            for j in 0..CHUNK_SIZE {
-                count += xor_result[j].count_ones() as usize;
-            }
-        }
-
-        // Handle remaining bytes
-        let remainder_start = chunks * CHUNK_SIZE;
-        for i in remainder_start..len {
-            count += (x[i] ^ y[i]).count_ones() as usize;
-        }
-
-        count
-    }
-}
-
-fn to_bit_string(data: &[u8]) -> String {
-    data.iter()
-        .map(|byte| format!("{:08b}", byte))
-        .collect::<Vec<String>>()
-        .join("")
-}
-
-fn hamming_distance(x: &[u8], y: &[u8]) -> usize {
-    let len = x.len();
-    let mut count = 0;
-
-    let chunks = len / CHUNK_SIZE;
-    for i in 0..chunks {
-        let start = i * CHUNK_SIZE;
-
-        let x_vec = u8x8::from_slice(&x[start..start + CHUNK_SIZE]);
-        let y_vec = u8x8::from_slice(&y[start..start + CHUNK_SIZE]);
-
-        let xor_result = x_vec ^ y_vec;
-
-        for j in 0..CHUNK_SIZE {
-            count += xor_result[j].count_ones() as usize;
-        }
-    }
-
-    // Handle remaining bytes
-    let remainder_start = chunks * CHUNK_SIZE;
-    for i in remainder_start..len {
-        count += (x[i] ^ y[i]).count_ones() as usize;
-    }
-
-    count
-}
-
-fn hamming_distance_list(x: &[u8], y: &[u8]) -> usize {
-    x.iter()
-        .zip(y.iter())
-        .fold(0, |acc, (x, y)| acc + (x ^ y).count_ones() as usize)
-}
+// fn to_bit_string(data: &[u8]) -> String {
+//     data.iter()
+//         .map(|byte| format!("{:08b}", byte))
+//         .collect::<Vec<String>>()
+//         .join("")
+// }
 
 fn median_sorted_vec<T>(vec: &Vec<T>) -> T
 where
@@ -104,40 +44,84 @@ where
     }
 }
 
-pub trait TreeNode: Debug {
+pub trait TreeNode<V, T>: Debug + Sync + TreeNodeMetrics {
     fn search(
         &self,
-        i: &[u8],
-        radius: usize,
+        pruner: &Arc<dyn BranchPruner<T>>,
+        distance: &Arc<dyn DistanceMetric<[V], T>>,
+        i: &[V],
+        radius: T,
         k: usize,
-        results: Arc<Mutex<Vec<(usize, Vec<u8>)>>>,
+        results: Arc<Mutex<Vec<(T, Vec<V>)>>>,
     ) -> Result<(), AnyError>;
 
-    fn add(&mut self, i: &[u8]) -> Result<usize, AnyError>;
-    fn size(&self) -> (usize, usize, usize);
+    fn add(&mut self, distance: &Arc<dyn DistanceMetric<[V], T>>, i: &[V]) -> Result<T, AnyError>;
+    // fn size(&self) -> (usize, usize, usize);
 }
 
 #[derive(Debug)]
-pub struct VPNode {
-    vantage_point: Option<Vec<u8>>,
-    threshhold: Option<usize>,
-    values: Vec<Vec<u8>>,
-    near_nodes: Option<Box<VPNode>>,
-    far_nodes: Option<Box<VPNode>>,
+pub struct TreeMetrics {
+    nodes: usize,
+    leaves: usize,
+    elements: usize,
+    max_depth: usize,
+    min_depth: usize,
+    steps: usize,
+    avg_depth: f32,
 }
 
-impl VPNode {
+impl TreeMetrics {
+    fn new() -> Self {
+        TreeMetrics {
+            nodes: 0,
+            leaves: 0,
+            elements: 0,
+            max_depth: 0,
+            min_depth: usize::MAX,
+            steps: 0,
+            avg_depth: 0.0,
+        }
+    }
+}
+
+impl AddAssign for TreeMetrics {
+    fn add_assign(&mut self, rhs: Self) {
+        self.nodes += rhs.nodes;
+        self.leaves += rhs.leaves;
+        self.elements += rhs.elements;
+        self.steps += rhs.steps + 1;
+
+        self.max_depth = max(self.max_depth, rhs.max_depth);
+        self.min_depth = min(self.min_depth, rhs.min_depth);
+        self.avg_depth = self.steps as f32 / self.leaves as f32;
+    }
+}
+
+pub trait TreeNodeMetrics {
+    fn size(&self) -> TreeMetrics;
+}
+
+#[derive(Debug)]
+pub struct VPNode<V, T> {
+    vantage_point: Option<Vec<V>>,
+    threshold: Option<T>,
+    values: Vec<Vec<V>>,
+    near_nodes: Option<Box<dyn TreeNode<V, T>>>,
+    far_nodes: Option<Box<dyn TreeNode<V, T>>>,
+}
+
+impl VPNode<u8, usize> {
     pub fn new() -> Self {
         Self {
             vantage_point: None,
-            threshhold: None,
+            threshold: None,
             values: Vec::new(),
             near_nodes: None,
             far_nodes: None,
         }
     }
 
-    fn create_leaf(&mut self, i: &[u8]) {
+    fn create_leaf(&mut self, distance: &Arc<dyn DistanceMetric<[u8], usize>>, i: &[u8]) {
         if self.values.len() < LEAF_CAP {
             let vec = i.to_vec();
             if !self.values.contains(&vec) {
@@ -152,7 +136,7 @@ impl VPNode {
                         .values
                         .iter()
                         .filter(|&y| !x.eq(y))
-                        .map(|y| (hamming_distance(x, y), y.clone()))
+                        .map(|y| (distance.distance(x, y), y.clone()))
                         .collect();
 
                     let avg_distance: usize =
@@ -169,16 +153,23 @@ impl VPNode {
 
             distances.sort_by_key(|&(x, _)| x);
             let (threshold, _) = median_sorted_vec(&distances);
-            self.threshhold = Some(threshold);
+            self.threshold = Some(threshold);
 
-            self.far_nodes = self.create_node(|x| hamming_distance(x, &vantage_point) > threshold);
-            self.near_nodes =
-                self.create_node(|x| hamming_distance(x, &vantage_point) <= threshold);
+            self.far_nodes = self.create_node(&distance, |x| {
+                distance.distance(x, &vantage_point) > threshold
+            });
+            self.near_nodes = self.create_node(&distance, |x| {
+                distance.distance(x, &vantage_point) <= threshold
+            });
             self.values.clear();
         }
     }
 
-    fn create_node<F>(&mut self, f: F) -> Option<Box<VPNode>>
+    fn create_node<F>(
+        &mut self,
+        distance: &Arc<dyn DistanceMetric<[u8], usize>>,
+        f: F,
+    ) -> Option<Box<dyn TreeNode<u8, usize>>>
     where
         F: Fn(&[u8]) -> bool,
     {
@@ -192,7 +183,7 @@ impl VPNode {
 
             let mut node = VPNode::new();
             values.iter().for_each(|x| {
-                let _ = node.add(&x);
+                let _ = node.add(&distance, &x);
             });
 
             return Some(Box::new(node));
@@ -201,9 +192,11 @@ impl VPNode {
     }
 }
 
-impl TreeNode for VPNode {
+impl TreeNode<u8, usize> for VPNode<u8, usize> {
     fn search(
         &self,
+        pruner: &Arc<dyn BranchPruner<usize>>,
+        distance: &Arc<dyn DistanceMetric<[u8], usize>>,
         i: &[u8],
         radius: usize,
         k: usize,
@@ -213,12 +206,12 @@ impl TreeNode for VPNode {
             let res = self
                 .values
                 .iter()
-                .map(|x| (hamming_distance(x, &i), x.clone()))
+                .map(|x| (distance.distance(x, &i), x.clone()))
                 .filter(|&(x, _)| x <= radius)
                 .collect::<Vec<(usize, Vec<u8>)>>();
             results.lock().expect("Results were locked").extend(res);
         } else if let Some(vantage_point) = &self.vantage_point {
-            let dist = hamming_distance(vantage_point, i);
+            let dist = distance.distance(vantage_point, i);
             if dist <= radius {
                 results
                     .lock()
@@ -226,18 +219,34 @@ impl TreeNode for VPNode {
                     .push((dist, i.to_vec()));
             }
 
+            let (near_shake, far_shake) = pruner.prune(dist, radius, self.threshold.unwrap());
+
             rayon::join(
                 || {
-                    if dist.saturating_sub(radius) <= self.threshhold.unwrap() {
+                    if near_shake {
                         if let Some(near_nodes) = &self.near_nodes {
-                            let _ = near_nodes.search(i, radius, k, Arc::clone(&results));
+                            let _ = near_nodes.search(
+                                &pruner,
+                                &distance,
+                                i,
+                                radius,
+                                k,
+                                Arc::clone(&results),
+                            );
                         }
                     }
                 },
                 || {
-                    if dist.saturating_add(radius) > self.threshhold.unwrap() {
+                    if far_shake {
                         if let Some(far_nodes) = &self.far_nodes {
-                            let _ = far_nodes.search(i, radius, k, Arc::clone(&results));
+                            let _ = far_nodes.search(
+                                &pruner,
+                                &distance,
+                                i,
+                                radius,
+                                k,
+                                Arc::clone(&results),
+                            );
                         }
                     }
                 },
@@ -247,59 +256,74 @@ impl TreeNode for VPNode {
         return Ok(());
     }
 
-    fn add(&mut self, i: &[u8]) -> Result<usize, AnyError> {
+    fn add(
+        &mut self,
+        distance: &Arc<dyn DistanceMetric<[u8], usize>>,
+        i: &[u8],
+    ) -> Result<usize, AnyError> {
         if let Some(vantage_point) = &self.vantage_point {
-            let dist = hamming_distance(&vantage_point, &i);
+            let dist = distance.distance(&vantage_point, &i);
             if dist == 0 {
                 return Ok(dist);
             }
 
-            if dist > self.threshhold.unwrap() {
-                return self.far_nodes.as_mut().unwrap().add(i);
+            if dist > self.threshold.unwrap() {
+                return self.far_nodes.as_mut().unwrap().add(&distance, i);
             } else {
-                return self.near_nodes.as_mut().unwrap().add(i);
+                return self.near_nodes.as_mut().unwrap().add(&distance, i);
             }
         } else {
-            self.create_leaf(i);
+            self.create_leaf(&distance, i);
         }
 
         Ok(0)
     }
+}
 
-    fn size(&self) -> (usize, usize, usize) {
+impl<V, T> TreeNodeMetrics for VPNode<V, T> {
+    fn size(&self) -> TreeMetrics {
+        let mut metrics = TreeMetrics::new();
+
         if let Some(_) = &self.vantage_point {
-            let mut counter = (0, 0, 0);
+            metrics.nodes += 1;
             if let Some(near_nodes) = &self.near_nodes {
-                let (nodes, leaves, elements) = near_nodes.size();
-                counter.0 += nodes + 1;
-                counter.1 += leaves;
-                counter.2 += elements + 1;
+                metrics += near_nodes.size();
             }
             if let Some(far_nodes) = &self.far_nodes {
-                let (nodes, leaves, elements) = far_nodes.size();
-                counter.0 += nodes + 1;
-                counter.1 += leaves;
-                counter.2 += elements + 1;
+                metrics += far_nodes.size();
             }
-
-            counter
         } else {
-            (0, 1, self.values.len())
+            metrics.leaves = 1;
+            metrics.min_depth = 1;
+            metrics.elements = self.values.len() + 1;
         }
+
+        metrics.max_depth += 1;
+        metrics.min_depth = metrics.min_depth.saturating_add(1);
+
+        return metrics;
     }
 }
 
 #[derive(Debug)]
-pub struct VantagePointTree {
-    size: usize,
-    tree: Option<Arc<Mutex<dyn TreeNode>>>,
+pub struct VantagePointTree<'a, V, T> {
+    size: T,
+    tree: Option<Arc<Mutex<dyn TreeNode<V, T>>>>,
+    pruner: &'a Arc<dyn BranchPruner<T>>,
+    distance: &'a Arc<dyn DistanceMetric<[V], T>>,
 }
 
-impl VantagePointTree {
-    pub fn new(size: usize) -> Self {
+impl<'a> VantagePointTree<'a, u8, usize> {
+    pub fn new(
+        size: usize,
+        pruner: &'a Arc<dyn BranchPruner<usize>>,
+        distancer: &'a Arc<dyn DistanceMetric<[u8], usize>>,
+    ) -> Self {
         VantagePointTree {
             size: size,
             tree: None,
+            pruner: pruner,
+            distance: distancer,
         }
     }
 
@@ -322,7 +346,14 @@ impl VantagePointTree {
                 let _ = tree
                     .lock()
                     .unwrap()
-                    .search(val, radius, 50, Arc::clone(&results))
+                    .search(
+                        &self.pruner,
+                        &self.distance,
+                        val,
+                        radius,
+                        50,
+                        Arc::clone(&results),
+                    )
                     .unwrap();
                 results.lock().unwrap().sort_by_key(|&(x, _)| x);
                 let top: Vec<(usize, Vec<u8>)> = results
@@ -354,7 +385,12 @@ impl VantagePointTree {
                     .clone()
                     .unwrap_or_else(|| Arc::new(Mutex::new(VPNode::new())));
 
-                match root.clone().lock().unwrap().add(&x.to_vec()) {
+                match root
+                    .clone()
+                    .lock()
+                    .unwrap()
+                    .add(&self.distance, &x.to_vec())
+                {
                     Ok(x) => {
                         self.tree = Some(root.clone());
                         Ok(x)
@@ -367,18 +403,18 @@ impl VantagePointTree {
         Ok(res)
     }
 
-    fn size(&self) -> (usize, usize, usize) {
+    fn size(&self) -> TreeMetrics {
         if let Some(tree) = &self.tree {
             if let Ok(tree) = tree.lock() {
                 return tree.size();
             }
         }
 
-        (0, 0, 0)
+        TreeMetrics::new()
     }
 }
 
-fn seed_tree(tree: &mut VantagePointTree) -> Result<(), Error> {
+fn seed_tree(tree: &mut VantagePointTree<u8, usize>) -> Result<(), Error> {
     let values = OpenOptions::new().read(true).open("./file.vals")?;
     let mut buf = String::new();
     let mut reader = BufReader::new(values);
@@ -398,13 +434,20 @@ fn seed_tree(tree: &mut VantagePointTree) -> Result<(), Error> {
 }
 
 fn main() -> Result<(), Error> {
-    let mut tree = VantagePointTree::new(CHUNK_SIZE);
+    let pruner: Arc<dyn BranchPruner<usize>> = Arc::new(&ExactShaker);
+    let hamming: Arc<dyn DistanceMetric<[u8], usize>> = Arc::new(HammingDistance::new(8));
+
+    let mut tree = VantagePointTree::<u8, usize>::new(CHUNK_SIZE, &pruner, &hamming);
     seed_tree(&mut tree)?;
 
     // println!("{:?}", tree);
     let term = "34ec86d2".as_bytes().to_vec();
 
     println!("tree size {:?}", tree.size());
+    println!("result {:?}", tree.search(&term, 10, 10));
+    let pruner: Arc<dyn BranchPruner<usize>> = Arc::new(&AproximateShaker);
+
+    tree.pruner = &pruner;
     println!("result {:?}", tree.search(&term, 10, 10));
 
     Ok(())
@@ -418,8 +461,11 @@ mod tests {
     use test::Bencher;
 
     #[bench]
-    fn bench_tree_search(b: &mut Bencher) {
-        let mut tree = VantagePointTree::new(CHUNK_SIZE);
+    fn bench_tree_search_exact(b: &mut Bencher) {
+        let pruner: Arc<dyn BranchPruner<usize>> = Arc::new(&ExactShaker);
+        let hamming: Arc<dyn DistanceMetric<[u8], usize>> = Arc::new(HammingDistance::new(8));
+
+        let mut tree = VantagePointTree::new(CHUNK_SIZE, &pruner, &hamming);
         seed_tree(&mut tree).unwrap();
 
         let term = "34ec86d2".as_bytes().to_vec();
@@ -428,18 +474,15 @@ mod tests {
     }
 
     #[bench]
-    fn bench_hamming_distance_list(b: &mut Bencher) {
-        let term1 = "34ec86d2".as_bytes().to_vec();
-        let term2 = "35ef86d2".as_bytes().to_vec();
+    fn bench_tree_search_approximate(b: &mut Bencher) {
+        let pruner: Arc<dyn BranchPruner<usize>> = Arc::new(&AproximateShaker);
+        let hamming: Arc<dyn DistanceMetric<[u8], usize>> = Arc::new(HammingDistance::new(8));
 
-        b.iter(|| hamming_distance_list(&term1, &term2));
-    }
+        let mut tree = VantagePointTree::new(CHUNK_SIZE, &pruner, &hamming);
+        seed_tree(&mut tree).unwrap();
 
-    #[bench]
-    fn bench_hamming_distance(b: &mut Bencher) {
-        let term1 = "34ec86d2".as_bytes().to_vec();
-        let term2 = "35ef86d2".as_bytes().to_vec();
+        let term = "34ec86d2".as_bytes().to_vec();
 
-        b.iter(|| hamming_distance(&term1, &term2));
+        b.iter(|| tree.search(&term, 5, 10));
     }
 }
