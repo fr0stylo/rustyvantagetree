@@ -1,5 +1,5 @@
 TODO:
 - [ ] Top K elements search
-- [ ] Add conditional tree pruning
-- [ ] Add generics support for math
-- [ ] Add support for diferent metrics calculation algorithms
+- [x] Add conditional tree pruning
+- [x] Add generics support for math
+- [x] Add support for diferent metrics calculation algorithms
