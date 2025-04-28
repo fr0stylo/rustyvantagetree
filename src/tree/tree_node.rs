@@ -5,9 +5,8 @@ use std::{
 
 use anyerror::AnyError;
 
-use crate::TreeNodePromoter;
-
 use super::{
+    promoter::TreeNodePromoter,
     result_set::{ResultEntry, ResultSet},
     BranchPruner, DistanceMetric, TreeNodeMetrics,
 };

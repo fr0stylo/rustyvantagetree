@@ -13,6 +13,10 @@ impl ResultEntry {
             distance: i.0,
         }
     }
+
+    pub fn dist(&self) -> usize {
+        self.distance
+    }
 }
 
 impl PartialOrd for ResultEntry {

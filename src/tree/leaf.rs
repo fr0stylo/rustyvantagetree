@@ -2,6 +2,8 @@ use std::sync::{Arc, Mutex};
 
 use anyerror::AnyError;
 
+use rayon::prelude::*;
+
 use super::{
     median_sorted_vec,
     promoter::TreeNodePromoter,
@@ -49,7 +51,7 @@ impl TreeNodePromoter<u8, usize> for VPLeaf<u8, usize> {
 
         let mut vantage_points: Vec<(usize, Vec<(usize, Vec<u8>)>, Vec<u8>)> = self
             .values
-            .iter()
+            .par_iter()
             .map(|x| {
                 let distances: Vec<(usize, Vec<u8>)> = self
                     .values
@@ -73,14 +75,14 @@ impl TreeNodePromoter<u8, usize> for VPLeaf<u8, usize> {
 
         let far = self.make_leaf(
             distances
-                .iter()
+                .par_iter()
                 .filter(|(x, _)| x.clone() > threshold && x.clone() != 0)
                 .map(|(_, x)| x.clone())
                 .collect(),
         );
         let near = self.make_leaf(
             distances
-                .iter()
+                .par_iter()
                 .filter(|(x, _)| x.clone() <= threshold && x.clone() != 0)
                 .map(|(_, x)| x.clone())
                 .collect(),
@@ -114,7 +116,7 @@ impl TreeNode<u8, usize> for VPLeaf<u8, usize> {
     ) -> Result<(), AnyError> {
         let res = self
             .values
-            .iter()
+            .par_iter()
             .map(|x| (distance.distance(x, &i), x.clone()))
             .filter(|(x, _)| *x <= radius)
             .map(|x| ResultEntry::from_tuple(x))
