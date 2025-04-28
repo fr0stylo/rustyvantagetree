@@ -8,7 +8,8 @@ use std::{
     fmt::Debug,
     fs::OpenOptions,
     io::{BufRead, BufReader, Error},
-    ops::AddAssign,
+    marker::PhantomData,
+    ops::{AddAssign, Deref},
     sync::{Arc, Mutex},
     usize,
 };
@@ -19,7 +20,7 @@ use distance::{DistanceMetric, HammingDistance};
 use treeshaker::*;
 
 const CHUNK_SIZE: usize = 8;
-const LEAF_CAP: usize = 512;
+const LEAF_CAP: usize = 20;
 
 // fn to_bit_string(data: &[u8]) -> String {
 //     data.iter()
@@ -44,7 +45,7 @@ where
     }
 }
 
-pub trait TreeNode<V, T>: Debug + Sync + TreeNodeMetrics {
+pub trait TreeNode<V, T>: Debug + Sync + TreeNodeMetrics + TreeNodePromoter<V, T> {
     fn search(
         &self,
         pruner: &Arc<dyn BranchPruner<T>>,
@@ -82,6 +83,17 @@ impl TreeMetrics {
             avg_depth: 0.0,
         }
     }
+    fn leaf(size: usize) -> Self {
+        TreeMetrics {
+            nodes: 0,
+            leaves: 1,
+            elements: size,
+            max_depth: 0,
+            min_depth: 1,
+            steps: 0,
+            avg_depth: 0.0,
+        }
+    }
 }
 
 impl AddAssign for TreeMetrics {
@@ -99,6 +111,150 @@ impl AddAssign for TreeMetrics {
 
 pub trait TreeNodeMetrics {
     fn size(&self) -> TreeMetrics;
+}
+pub trait TreeNodePromoter<V, T> {
+    fn promote(
+        &self,
+        distance: &Arc<dyn DistanceMetric<[V], T>>,
+    ) -> Option<Box<dyn TreeNode<V, T>>> {
+        None
+    }
+
+    fn need_promotion(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Debug)]
+pub struct VPLeaf<V, T> {
+    values: Vec<Vec<V>>,
+    _threshold: Option<T>,
+}
+
+impl<V, T> VPLeaf<V, T> {
+    pub fn new() -> Self {
+        Self {
+            values: Vec::new(),
+            _threshold: None,
+        }
+    }
+
+    fn extend(&mut self, i: Vec<Vec<V>>) {
+        self.values.extend(i);
+    }
+}
+
+impl VPLeaf<u8, usize> {
+    fn make_leaf(&self, f: Vec<Vec<u8>>) -> Option<Box<dyn TreeNode<u8, usize>>> {
+        let mut node = VPLeaf::<u8, usize>::new();
+
+        node.extend(f);
+
+        return Some(Box::new(node));
+    }
+}
+
+impl TreeNodePromoter<u8, usize> for VPLeaf<u8, usize> {
+    fn promote(
+        &self,
+        distance: &Arc<dyn DistanceMetric<[u8], usize>>,
+    ) -> Option<Box<dyn TreeNode<u8, usize>>> {
+        if self.values.len() < 2 {
+            return None; // Can't promote a leaf with fewer than 2 values
+        }
+
+        let mut node = VPNode::<u8, usize>::new();
+
+        let mut vantage_points: Vec<(usize, Vec<(usize, Vec<u8>)>, Vec<u8>)> = self
+            .values
+            .iter()
+            .map(|x| {
+                let distances: Vec<(usize, Vec<u8>)> = self
+                    .values
+                    .iter()
+                    .filter(|&y| !x.eq(y))
+                    .map(|y| (distance.distance(x, y), y.clone()))
+                    .collect();
+
+                let avg_distance: usize =
+                    distances.iter().fold(0, |acc, &(x, _)| acc + x) / distances.len();
+
+                (avg_distance, distances, x.clone())
+            })
+            .collect();
+
+        vantage_points.sort_by_key(|&(x, _, _)| x);
+
+        let (_avg_distance, mut distances, vantage_point) = median_sorted_vec(&vantage_points);
+        node.vantage_point = Some(vantage_point.clone());
+
+        distances.sort_by_key(|&(x, _)| x);
+        let (threshold, _) = median_sorted_vec(&distances);
+        node.threshold = Some(threshold);
+
+        node.far_nodes = self.make_leaf(
+            distances
+                .iter()
+                .filter(|(x, _)| x.clone() > threshold && x.clone() != 0)
+                .map(|(_, x)| x.clone())
+                .collect(),
+        );
+        node.near_nodes = self.make_leaf(
+            distances
+                .iter()
+                .filter(|(x, _)| x.clone() <= threshold && x.clone() != 0)
+                .map(|(_, x)| x.clone())
+                .collect(),
+        );
+
+        Some(Box::new(node))
+    }
+
+    fn need_promotion(&self) -> bool {
+        self.values.len() >= LEAF_CAP
+    }
+}
+
+impl<V, T> TreeNodeMetrics for VPLeaf<V, T> {
+    fn size(&self) -> TreeMetrics {
+        return TreeMetrics::leaf(self.values.len());
+    }
+}
+
+impl TreeNode<u8, usize> for VPLeaf<u8, usize> {
+    fn search(
+        &self,
+        _pruner: &Arc<dyn BranchPruner<usize>>,
+        distance: &Arc<dyn DistanceMetric<[u8], usize>>,
+        i: &[u8],
+        radius: usize,
+        _k: usize,
+        results: Arc<Mutex<Vec<(usize, Vec<u8>)>>>,
+    ) -> Result<(), AnyError> {
+        let res = self
+            .values
+            .iter()
+            .map(|x| (distance.distance(x, &i), x.clone()))
+            .filter(|&(x, _)| x <= radius)
+            .collect::<Vec<(usize, Vec<u8>)>>();
+        results.lock().expect("Results were locked").extend(res);
+        Ok(())
+    }
+
+    fn add(
+        &mut self,
+        _distance: &Arc<dyn DistanceMetric<[u8], usize>>,
+        i: &[u8],
+    ) -> Result<usize, AnyError> {
+        // if self.values.len() <= LEAF_CAP {
+        let vec = i.to_vec();
+        if !self.values.contains(&vec) {
+            self.values.push(vec);
+        }
+        // }
+
+        Ok(1)
+    }
 }
 
 #[derive(Debug)]
@@ -120,77 +276,9 @@ impl VPNode<u8, usize> {
             far_nodes: None,
         }
     }
-
-    fn create_leaf(&mut self, distance: &Arc<dyn DistanceMetric<[u8], usize>>, i: &[u8]) {
-        if self.values.len() < LEAF_CAP {
-            let vec = i.to_vec();
-            if !self.values.contains(&vec) {
-                self.values.push(vec);
-            }
-        } else {
-            let mut vantage_points: Vec<(usize, Vec<(usize, Vec<u8>)>, Vec<u8>)> = self
-                .values
-                .iter()
-                .map(|x| {
-                    let distances: Vec<(usize, Vec<u8>)> = self
-                        .values
-                        .iter()
-                        .filter(|&y| !x.eq(y))
-                        .map(|y| (distance.distance(x, y), y.clone()))
-                        .collect();
-
-                    let avg_distance: usize =
-                        distances.iter().fold(0, |acc, &(x, _)| acc + x) / distances.len();
-
-                    (avg_distance, distances, x.clone())
-                })
-                .collect();
-
-            vantage_points.sort_by_key(|&(x, _, _)| x);
-
-            let (_avg_distance, mut distances, vantage_point) = median_sorted_vec(&vantage_points);
-            self.vantage_point = Some(vantage_point.clone());
-
-            distances.sort_by_key(|&(x, _)| x);
-            let (threshold, _) = median_sorted_vec(&distances);
-            self.threshold = Some(threshold);
-
-            self.far_nodes = self.create_node(&distance, |x| {
-                distance.distance(x, &vantage_point) > threshold
-            });
-            self.near_nodes = self.create_node(&distance, |x| {
-                distance.distance(x, &vantage_point) <= threshold
-            });
-            self.values.clear();
-        }
-    }
-
-    fn create_node<F>(
-        &mut self,
-        distance: &Arc<dyn DistanceMetric<[u8], usize>>,
-        f: F,
-    ) -> Option<Box<dyn TreeNode<u8, usize>>>
-    where
-        F: Fn(&[u8]) -> bool,
-    {
-        if let Some(_) = &self.vantage_point {
-            let values: Vec<Vec<u8>> = self
-                .values
-                .iter()
-                .filter(|&x| f(x))
-                .map(|x| x.clone())
-                .collect();
-
-            let mut node = VPNode::new();
-            values.iter().for_each(|x| {
-                let _ = node.add(&distance, &x);
-            });
-
-            return Some(Box::new(node));
-        }
-        None
-    }
 }
+
+impl<V, T> TreeNodePromoter<V, T> for VPNode<V, T> {}
 
 impl TreeNode<u8, usize> for VPNode<u8, usize> {
     fn search(
@@ -261,22 +349,30 @@ impl TreeNode<u8, usize> for VPNode<u8, usize> {
         distance: &Arc<dyn DistanceMetric<[u8], usize>>,
         i: &[u8],
     ) -> Result<usize, AnyError> {
-        if let Some(vantage_point) = &self.vantage_point {
-            let dist = distance.distance(&vantage_point, &i);
-            if dist == 0 {
-                return Ok(dist);
-            }
-
-            if dist > self.threshold.unwrap() {
-                return self.far_nodes.as_mut().unwrap().add(&distance, i);
-            } else {
-                return self.near_nodes.as_mut().unwrap().add(&distance, i);
-            }
-        } else {
-            self.create_leaf(&distance, i);
+        let dist = distance.distance(&self.vantage_point.clone().unwrap(), &i);
+        if dist == 0 {
+            return Ok(dist);
         }
 
-        Ok(0)
+        if dist > self.threshold.unwrap() {
+            if let Some(far_nodes) = &self.far_nodes {
+                if far_nodes.need_promotion() {
+                    if let Some(promoted) = far_nodes.promote(distance) {
+                        self.far_nodes = Some(promoted)
+                    }
+                }
+            }
+            return self.far_nodes.as_mut().unwrap().add(&distance, i);
+        } else {
+            if let Some(near_nodes) = &self.near_nodes {
+                if near_nodes.need_promotion() {
+                    if let Some(promoted) = near_nodes.promote(distance) {
+                        self.near_nodes = Some(promoted)
+                    }
+                }
+            }
+            return self.near_nodes.as_mut().unwrap().add(&distance, i);
+        }
     }
 }
 
@@ -308,7 +404,7 @@ impl<V, T> TreeNodeMetrics for VPNode<V, T> {
 #[derive(Debug)]
 pub struct VantagePointTree<'a, V, T> {
     size: T,
-    tree: Option<Arc<Mutex<dyn TreeNode<V, T>>>>,
+    tree: Box<dyn TreeNode<V, T>>,
     pruner: &'a Arc<dyn BranchPruner<T>>,
     distance: &'a Arc<dyn DistanceMetric<[V], T>>,
 }
@@ -321,7 +417,7 @@ impl<'a> VantagePointTree<'a, u8, usize> {
     ) -> Self {
         VantagePointTree {
             size: size,
-            tree: None,
+            tree: Box::new(VPLeaf::<u8, usize>::new()),
             pruner: pruner,
             distance: distancer,
         }
@@ -340,33 +436,27 @@ impl<'a> VantagePointTree<'a, u8, usize> {
                 self.size
             )));
         }
-        match self.tree.clone() {
-            Some(tree) => {
-                let results = Arc::new(Mutex::new(Vec::new()));
-                let _ = tree
-                    .lock()
-                    .unwrap()
-                    .search(
-                        &self.pruner,
-                        &self.distance,
-                        val,
-                        radius,
-                        50,
-                        Arc::clone(&results),
-                    )
-                    .unwrap();
-                results.lock().unwrap().sort_by_key(|&(x, _)| x);
-                let top: Vec<(usize, Vec<u8>)> = results
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .take(k)
-                    .map(|x| x.clone())
-                    .collect();
-                Ok(top)
-            }
-            None => Err(AnyError::error("Tree has not been created")),
-        }
+        let results = Arc::new(Mutex::new(Vec::new()));
+        let _ = &self
+            .tree
+            .search(
+                &self.pruner,
+                &self.distance,
+                val,
+                radius,
+                50,
+                Arc::clone(&results),
+            )
+            .unwrap();
+        results.lock().unwrap().sort_by_key(|&(x, _)| x);
+        let top: Vec<(usize, Vec<u8>)> = results
+            .lock()
+            .unwrap()
+            .iter()
+            .take(k)
+            .map(|x| x.clone())
+            .collect();
+        Ok(top)
     }
 
     pub fn add(&mut self, item: Vec<u8>) -> Result<Vec<usize>, AnyError> {
@@ -380,23 +470,13 @@ impl<'a> VantagePointTree<'a, u8, usize> {
                     x.len()
                 );
 
-                let root = self
-                    .tree
-                    .clone()
-                    .unwrap_or_else(|| Arc::new(Mutex::new(VPNode::new())));
-
-                match root
-                    .clone()
-                    .lock()
-                    .unwrap()
-                    .add(&self.distance, &x.to_vec())
-                {
-                    Ok(x) => {
-                        self.tree = Some(root.clone());
-                        Ok(x)
+                if self.tree.need_promotion() {
+                    if let Some(tree) = self.tree.promote(&self.distance) {
+                        self.tree = tree;
                     }
-                    Err(e) => return Err(e),
                 }
+
+                return self.tree.as_mut().add(&self.distance, &x.to_vec());
             })
             .map(|x| x.unwrap())
             .collect();
@@ -404,13 +484,7 @@ impl<'a> VantagePointTree<'a, u8, usize> {
     }
 
     fn size(&self) -> TreeMetrics {
-        if let Some(tree) = &self.tree {
-            if let Ok(tree) = tree.lock() {
-                return tree.size();
-            }
-        }
-
-        TreeMetrics::new()
+        return self.tree.size();
     }
 }
 
@@ -439,7 +513,7 @@ fn main() -> Result<(), Error> {
 
     let mut tree = VantagePointTree::<u8, usize>::new(CHUNK_SIZE, &pruner, &hamming);
     seed_tree(&mut tree)?;
-
+    println!("Construction completed");
     // println!("{:?}", tree);
     let term = "34ec86d2".as_bytes().to_vec();
 
