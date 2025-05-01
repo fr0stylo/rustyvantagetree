@@ -130,12 +130,10 @@ impl TreeNode<u8, usize> for VPLeaf<u8, usize> {
         _distance: &Arc<dyn DistanceMetric<[u8], usize>>,
         i: &[u8],
     ) -> Result<usize, AnyError> {
-        // if self.values.len() <= LEAF_CAP {
         let vec = i.to_vec();
         if !self.values.contains(&vec) {
             self.values.push(vec);
         }
-        // }
 
         Ok(1)
     }
